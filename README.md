@@ -4,6 +4,12 @@
 
 Hitotokiは、カメラが捉えた小さな瞬間と親のひとことを、あとから自然な言葉で探せる「家族の記憶」にするハッカソンMVPです。
 
+## アーキテクチャ
+
+![Hitotokiデモのアーキテクチャ](docs/hitotoki-demo-architecture.png)
+
+実装に基づく詳細版は [`docs/hitotoki-demo-architecture.html`](docs/hitotoki-demo-architecture.html) で確認できます。
+
 ## MVPでできること
 
 - ブラウザのWebカメラを表示し、記憶モード中は約8秒ごとに静止画を取得
