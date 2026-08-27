@@ -9,6 +9,7 @@ import {
   Clock3,
   Heart,
   LoaderCircle,
+  Mic,
   Milk,
   Plus,
   Search,
@@ -17,12 +18,24 @@ import {
   VideoOff,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { blobToDataUrl, encodeMonoWav } from "@/lib/browser-audio";
 import type { Moment, SearchResult } from "@/lib/types";
 
 const CAPTURE_INTERVAL_MS = 8_000;
 const searchSuggestions = ["手を振っていたとき", "最後にミルクを飲んだのは？", "笑っていた瞬間"];
 
 type CaptureState = "idle" | "capturing" | "analyzing";
+type VoiceState = "idle" | "recording" | "transcribing";
+
+type VoiceRecording = {
+  stream: MediaStream;
+  context: AudioContext;
+  source: MediaStreamAudioSourceNode;
+  processor: ScriptProcessorNode;
+  sink: GainNode;
+  chunks: Float32Array[];
+  sampleRate: number;
+};
 
 async function parseResponse<T>(response: Response): Promise<T> {
   const payload = (await response.json()) as T & { error?: string };
@@ -49,7 +62,14 @@ function formatDate(timestamp: string) {
   }).format(date);
 }
 
+function isVoiceMoment(moment: Moment) {
+  return moment.metadata?.capture === "voice";
+}
+
 function MomentIcon({ moment }: { moment: Moment }) {
+  if (isVoiceMoment(moment)) {
+    return <Mic size={16} strokeWidth={1.8} />;
+  }
   const lower = moment.description.toLowerCase();
   if (lower.includes("ミルク") || lower.includes("milk") || lower.includes("飲")) {
     return <Milk size={16} strokeWidth={1.8} />;
@@ -65,6 +85,10 @@ function MomentIcon({ moment }: { moment: Moment }) {
 }
 
 function MomentCard({ moment, compact = false }: { moment: SearchResult; compact?: boolean }) {
+  const sourceLabel =
+    moment.source === "camera" ? "カメラ" : isVoiceMoment(moment) ? "家族の声" : "あなたのメモ";
+  const sourceClass = isVoiceMoment(moment) ? "voice" : moment.source;
+
   return (
     <article className={`moment-card ${compact ? "moment-card--compact" : ""}`}>
       {moment.imageUrl && (
@@ -74,12 +98,12 @@ function MomentCard({ moment, compact = false }: { moment: SearchResult; compact
       )}
       <div className="moment-card__body">
         <div className="moment-card__meta">
-          <span className={`source-icon source-icon--${moment.source}`}>
+          <span className={`source-icon source-icon--${sourceClass}`}>
             <MomentIcon moment={moment} />
           </span>
           <span>{formatTime(moment.timestamp)}</span>
           <span className="meta-dot">·</span>
-          <span>{moment.source === "camera" ? "カメラ" : "あなたのメモ"}</span>
+          <span>{sourceLabel}</span>
         </div>
         <p>{moment.description}</p>
         {moment.score !== undefined && (
@@ -95,6 +119,8 @@ export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const captureBusyRef = useRef(false);
+  const voiceRecordingRef = useRef<VoiceRecording | null>(null);
+  const voiceStopTimerRef = useRef<number | null>(null);
   const [cameraReady, setCameraReady] = useState(false);
   const [remembering, setRemembering] = useState(false);
   const [captureState, setCaptureState] = useState<CaptureState>("idle");
@@ -103,6 +129,8 @@ export default function Home() {
   const [moments, setMoments] = useState<Moment[]>([]);
   const [note, setNote] = useState("");
   const [savingNote, setSavingNote] = useState(false);
+  const [voiceState, setVoiceState] = useState<VoiceState>("idle");
+  const [voiceSeconds, setVoiceSeconds] = useState(0);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -131,8 +159,21 @@ export default function Home() {
     return () => {
       active = false;
       streamRef.current?.getTracks().forEach((track) => track.stop());
+      const recording = voiceRecordingRef.current;
+      recording?.stream.getTracks().forEach((track) => track.stop());
+      recording?.processor.disconnect();
+      recording?.source.disconnect();
+      recording?.sink.disconnect();
+      void recording?.context.close();
+      if (voiceStopTimerRef.current) window.clearTimeout(voiceStopTimerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (voiceState !== "recording") return;
+    const timer = window.setInterval(() => setVoiceSeconds((seconds) => seconds + 1), 1_000);
+    return () => window.clearInterval(timer);
+  }, [voiceState]);
 
   useEffect(() => {
     if (!nextCaptureAt || !remembering) {
@@ -257,6 +298,89 @@ export default function Home() {
       setNotice(error instanceof Error ? error.message : "メモを記憶できませんでした。");
     } finally {
       setSavingNote(false);
+    }
+  };
+
+  const finishVoiceRecording = useCallback(async () => {
+    const recording = voiceRecordingRef.current;
+    if (!recording) return;
+    voiceRecordingRef.current = null;
+
+    if (voiceStopTimerRef.current) {
+      window.clearTimeout(voiceStopTimerRef.current);
+      voiceStopTimerRef.current = null;
+    }
+
+    recording.processor.onaudioprocess = null;
+    recording.processor.disconnect();
+    recording.source.disconnect();
+    recording.sink.disconnect();
+    recording.stream.getTracks().forEach((track) => track.stop());
+    await recording.context.close();
+
+    setVoiceState("transcribing");
+    setNotice(null);
+    try {
+      const sampleCount = recording.chunks.reduce((total, chunk) => total + chunk.length, 0);
+      if (sampleCount < recording.sampleRate / 2) {
+        throw new Error("もう少し長く話してから止めてください。");
+      }
+
+      const wav = encodeMonoWav(recording.chunks, recording.sampleRate);
+      const audioDataUrl = await blobToDataUrl(wav);
+      const response = await fetch("/api/voice-moments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ audioDataUrl }),
+      });
+      const { moment } = await parseResponse<{ moment: Moment }>(response);
+      addMomentToTimeline(moment);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "声を記憶できませんでした。");
+    } finally {
+      setVoiceState("idle");
+      setVoiceSeconds(0);
+    }
+  }, [addMomentToTimeline]);
+
+  const startVoiceRecording = async () => {
+    if (voiceState !== "idle" || voiceRecordingRef.current) return;
+
+    setNotice(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        video: false,
+      });
+      const context = new AudioContext();
+      await context.resume();
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(4_096, 1, 1);
+      const sink = context.createGain();
+      const chunks: Float32Array[] = [];
+      sink.gain.value = 0;
+      processor.onaudioprocess = (event) => {
+        chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+      };
+      source.connect(processor);
+      processor.connect(sink);
+      sink.connect(context.destination);
+
+      voiceRecordingRef.current = {
+        stream,
+        context,
+        source,
+        processor,
+        sink,
+        chunks,
+        sampleRate: context.sampleRate,
+      };
+      setVoiceSeconds(0);
+      setVoiceState("recording");
+      voiceStopTimerRef.current = window.setTimeout(() => void finishVoiceRecording(), 30_000);
+    } catch {
+      setVoiceState("idle");
+      setNotice("マイクを使えませんでした。ブラウザのマイク許可を確認してください。");
     }
   };
 
@@ -399,6 +523,42 @@ export default function Home() {
                   覚えておく
                 </button>
               </form>
+              <div className="note-divider"><span>または、声で</span></div>
+              <button
+                type="button"
+                className={`voice-button ${voiceState === "recording" ? "voice-button--recording" : ""}`}
+                onClick={() => {
+                  if (voiceState === "recording") void finishVoiceRecording();
+                  else void startVoiceRecording();
+                }}
+                disabled={voiceState === "transcribing"}
+              >
+                <span className="voice-button__icon">
+                  {voiceState === "transcribing" ? (
+                    <LoaderCircle size={18} className="spin" />
+                  ) : voiceState === "recording" ? (
+                    <CircleStop size={18} fill="currentColor" />
+                  ) : (
+                    <Mic size={18} />
+                  )}
+                </span>
+                <span className="voice-button__copy">
+                  <strong>
+                    {voiceState === "recording"
+                      ? "話し終えたらタップ"
+                      : voiceState === "transcribing"
+                        ? "Shisaが言葉にしています"
+                        : "話してMomentを残す"}
+                  </strong>
+                  <small>{voiceState === "recording" ? "最大30秒で自動停止" : "親のひとことをそのまま記憶"}</small>
+                </span>
+                {voiceState === "recording" && (
+                  <span className="voice-live" aria-label={`${voiceSeconds}秒録音中`}>
+                    <span className="voice-wave" aria-hidden="true"><i /><i /><i /><i /></span>
+                    {voiceSeconds}s
+                  </span>
+                )}
+              </button>
             </section>
 
             <section className="recall-panel panel">
